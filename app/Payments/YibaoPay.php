@@ -33,8 +33,8 @@ class YibaoPay implements PaymentInterface
                 'type' => 'input',
             ],
             'yibao_channel' => [
-                'label' => 'CHANNEL',
-                'description' => 'alipay / wxpay / qqpay',
+                'label' => 'PAY METHOD',
+                'description' => '1000=Alipay H5 (default)',
                 'type' => 'input',
             ],
         ];
@@ -43,66 +43,48 @@ class YibaoPay implements PaymentInterface
     public function pay($order): array
     {
         $base = rtrim($this->config['yibao_base_url'] ?? 'https://yibaopay.cc', '/');
+        $payMethod = $this->config['yibao_channel'] ?? '1000';
+        $legacyMap = [
+            'alipay' => '1000',
+            'wxpay' => '2000',
+            'qqpay' => '3000',
+        ];
         $payload = [
-            'pid' => $this->config['yibao_merchant_id'] ?? '',
-            'type' => $this->config['yibao_channel'] ?? '',
-            'out_trade_no' => $order['trade_no'],
+            'mch_id' => $this->config['yibao_merchant_id'] ?? '',
+            'pay_method' => $legacyMap[$payMethod] ?? $payMethod,
+            'out_order_sn' => $order['trade_no'],
+            'money' => sprintf('%.2f', $order['total_amount'] / 100),
             'notify_url' => $order['notify_url'],
             'return_url' => $order['return_url'],
-            'name' => $order['trade_no'],
-            'money' => $order['total_amount'] / 100,
+            'client_ip' => $order['client_ip'] ?? ($_SERVER['REMOTE_ADDR'] ?? '127.0.0.1'),
+            'time' => (string) time(),
+            'extra' => $order['trade_no'],
         ];
 
-        if (empty($payload['pid']) || empty($this->config['yibao_secret_key'])) {
+        if (empty($payload['mch_id']) || empty($this->config['yibao_secret_key'])) {
             throw new ApiException(__('Payment gateway configuration error'));
         }
 
-        ksort($payload);
-        reset($payload);
-        $payload['sign'] = md5(stripslashes(urldecode(http_build_query($payload))) . $this->config['yibao_secret_key']);
-        $payload['sign_type'] = 'MD5';
+        $payload['sign'] = $this->buildSign($payload);
 
-        $endpoint = $base . '/submit.php';
-        $url = $endpoint . '?' . http_build_query($payload);
+        $endpoint = $base . '/prod/api/pay/create';
+        $response = $this->postJson($endpoint, $payload);
+        $data = json_decode($response, true);
 
-        // Try to exchange for a cashier link if the gateway supports JSON submission
-        $ch = curl_init($endpoint);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => http_build_query($payload),
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/x-www-form-urlencoded',
-            ],
-            CURLOPT_TIMEOUT => 30,
-        ]);
-        $resp = curl_exec($ch);
-        $err = curl_error($ch);
-        curl_close($ch);
+        if (!is_array($data)) {
+            throw new ApiException('YibaoPay create order failed: invalid response');
+        }
 
-        if ($resp && !$err) {
-            $json = json_decode($resp, true);
-            if (is_array($json)) {
-                $code = $json['code'] ?? ($json['status'] ?? '');
-                if (in_array($code, ['1', 1, 'SUCCESS', 'success', 'OK', 200], true)) {
-                    $link = $json['data']['payUrl']
-                        ?? $json['data']['url']
-                        ?? $json['payUrl']
-                        ?? $json['url']
-                        ?? '';
-                    if (!empty($link)) {
-                        return [
-                            'type' => 1,
-                            'data' => $link,
-                        ];
-                    }
-                }
-            }
+        $payUrl = $data['data']['pay_url'] ?? ($data['data']['payUrl'] ?? null);
+
+        if ((int) ($data['code'] ?? 0) !== 200 || empty($payUrl)) {
+            $message = $data['msg'] ?? $data['message'] ?? 'request failed';
+            throw new ApiException('YibaoPay create order failed: ' . $message);
         }
 
         return [
             'type' => 1,
-            'data' => $url,
+            'data' => $payUrl,
         ];
     }
 
@@ -113,24 +95,65 @@ class YibaoPay implements PaymentInterface
         }
 
         $sign = $params['sign'];
-        $data = $params;
-        unset($data['sign'], $data['sign_type']);
-        ksort($data);
-        reset($data);
-
-        $calcSign = md5(stripslashes(urldecode(http_build_query($data))) . ($this->config['yibao_secret_key'] ?? ''));
+        $calcSign = $this->buildSign($params);
         if ($calcSign !== $sign) {
             return false;
         }
 
-        $tradeNo = $params['out_trade_no'] ?? ($params['trade_no'] ?? '');
+        $tradeNo = $params['out_order_sn'] ?? ($params['out_trade_no'] ?? ($params['trade_no'] ?? ''));
         if (empty($tradeNo)) {
             return false;
         }
 
         return [
             'trade_no' => $tradeNo,
-            'callback_no' => $params['trade_no'] ?? '',
+            'callback_no' => $params['order_sn'] ?? ($params['trade_no'] ?? ''),
         ];
+    }
+
+    private function buildSign(array $params): string
+    {
+        $filtered = [];
+        foreach ($params as $key => $value) {
+            if ($key === 'sign' || $value === '' || $value === null) {
+                continue;
+            }
+            $filtered[$key] = $value;
+        }
+
+        ksort($filtered);
+
+        $pairs = [];
+        foreach ($filtered as $key => $value) {
+            $pairs[] = $key . '=' . $value;
+        }
+
+        $baseString = implode('&', $pairs) . '&key=' . ($this->config['yibao_secret_key'] ?? '');
+
+        return strtoupper(md5($baseString));
+    }
+
+    private function postJson(string $url, array $payload): string
+    {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/json',
+            ],
+            CURLOPT_TIMEOUT => 30,
+        ]);
+
+        $resp = curl_exec($ch);
+        $err = curl_error($ch);
+        curl_close($ch);
+
+        if ($err) {
+            throw new ApiException('YibaoPay request error: ' . $err);
+        }
+
+        return $resp ?: '';
     }
 }
