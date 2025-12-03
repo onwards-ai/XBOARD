@@ -90,13 +90,28 @@ class YibaoPay implements PaymentInterface
 
     public function notify($params): array|bool
     {
+        // Yibao sends JSON POST; make sure we read raw body if controller didn't parse it.
+        if (empty($params)) {
+            $raw = file_get_contents('php://input');
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                $params = $decoded;
+            }
+        }
+
         if (!isset($params['sign'])) {
             return false;
         }
 
-        $sign = $params['sign'];
+        $sign = strtoupper($params['sign']);
         $calcSign = $this->buildSign($params);
         if ($calcSign !== $sign) {
+            return false;
+        }
+
+        // status check (doc: paid)
+        $status = strtolower((string) ($params['status'] ?? $params['trade_status'] ?? ''));
+        if (!empty($status) && !in_array($status, ['paid', 'success', 'succ', '1', '200'], true)) {
             return false;
         }
 
@@ -108,6 +123,7 @@ class YibaoPay implements PaymentInterface
         return [
             'trade_no' => $tradeNo,
             'callback_no' => $params['order_sn'] ?? ($params['trade_no'] ?? ''),
+            'custom_result' => 'SUCCESS', // Yibao expects uppercase SUCCESS
         ];
     }
 
